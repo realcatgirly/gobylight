@@ -6,6 +6,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -146,6 +147,7 @@ func newTeamsLogfileReader(filePath string, statusC chan TeamsStatus, done chan 
 					statusC <- newestStatus // Send the latest status to the channel
 				}
 				offset = info.Size() // Update the offset to the new end of the file
+				time.Sleep(time.Second)
 			}
 		}
 	}()
