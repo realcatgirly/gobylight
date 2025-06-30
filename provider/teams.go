@@ -14,7 +14,7 @@ import (
 // based on the logfiles that teams writes out
 
 var (
-	statusRegex = regexp.MustCompile("^.*TaskbarBadgeServicePackaged:.*status (.*)$")
+	statusRegex = regexp.MustCompile("^.*Badge.*status (.*)$")
 )
 
 func init() {
@@ -23,13 +23,21 @@ func init() {
 
 func newTeams(c chan color.RGBA, done chan struct{}) error {
 	statusC := make(chan TeamsStatus)
-	if err := newTeamsLogfileReader(statusC, done); err != nil {
+	pathC := make(chan string, 1)
+	readerDone := make(chan struct{})
+	if err := newTeamsLogfileTracker(pathC, done); err != nil {
 		return err
 	}
 
 	go func() {
 		for {
 			select {
+			case path := <-pathC:
+				close(readerDone)
+				readerDone = make(chan struct{})
+				if err := newTeamsLogfileReader(path, statusC, readerDone); err != nil {
+					panic(err)
+				}
 			case status := <-statusC:
 				if color, ok := StatusColor[status]; ok {
 					c <- color
@@ -43,13 +51,14 @@ func newTeams(c chan color.RGBA, done chan struct{}) error {
 	return nil
 }
 
-func newTeamsLogfileReader(tsc chan TeamsStatus, done chan struct{}) error {
+func newTeamsLogfileTracker(pathC chan string, done chan struct{}) error {
 	const logFilePath = `\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Logs`
 	userDirPrefix, err := os.UserCacheDir()
 	if err != nil {
 		return err
 	}
 	var logFileFolder = userDirPrefix + logFilePath
+	_ = logFileFolder
 
 	logWatcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -60,74 +69,141 @@ func newTeamsLogfileReader(tsc chan TeamsStatus, done chan struct{}) error {
 		for {
 			select {
 			case event, ok := <-logWatcher.Events:
-				fmt.Printf("event: %s\n", event.Name)
 				if !ok {
-					return
+					continue
 				}
-				if !isRelevant(event) {
-					return
+				if !isRelevantEvent(event) {
+					continue
 				}
-				status, err := getLatestStatus(event.Name)
+				fileName, err := getLatestFileName(logFileFolder)
 				if err != nil {
 					fmt.Printf("%s", err.Error())
-					return
+					continue
 				}
-				if status != TeamsStatusUnknown {
-					tsc <- status
-				}
+				path := logFileFolder + "\\" + fileName
+				pathC <- path
 			case err, ok := <-logWatcher.Errors:
 				if !ok {
-					return
+					continue
 				}
 				fmt.Printf("%s", err.Error())
 			case <-done:
+				logWatcher.Close()
 				return
 			}
 		}
 	}()
 
-	if err := logWatcher.Add(logFileFolder); err != nil {
+	fileName, err := getLatestFileName(logFileFolder)
+	if err != nil {
 		return err
 	}
+	path := logFileFolder + "\\" + fileName
+	pathC <- path
 
 	return nil
 }
 
-func isRelevant(event fsnotify.Event) bool {
-	if event.Op != fsnotify.Write {
-		return false
-	}
-	return strings.Contains(event.Name, "MSTeams_") && strings.HasSuffix(event.Name, ".log")
+func newTeamsLogfileReader(filePath string, statusC chan TeamsStatus, done chan struct{}) error {
+	fmt.Printf("Reading Teams logfile %s\n", filePath)
+	offset := int64(0)
+
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				info, err := os.Stat(filePath)
+				if err != nil {
+					fmt.Printf("Error stating file %s: %s\n", filePath, err.Error())
+					continue
+				}
+				if info.Size() <= offset {
+					continue // file has not changed
+				}
+				file, err := os.Open(filePath)
+				if err != nil {
+					fmt.Printf("Error opening file %s: %s\n", filePath, err.Error())
+					continue
+				}
+				defer file.Close()
+				file.Seek(offset, 0) // Seek to the last read position
+				buffer := make([]byte, info.Size()-offset)
+				_, err = file.Read(buffer)
+				if err != nil {
+					fmt.Printf("Error reading file %s: %s\n", filePath, err.Error())
+					continue
+				}
+				lines := strings.Split(string(buffer), "\n")
+				newestStatus := TeamsStatusUnknown
+				for _, line := range lines {
+					if status := readLine(line); status != TeamsStatusUnknown {
+						newestStatus = status
+					}
+				}
+				if newestStatus != TeamsStatusUnknown {
+					statusC <- newestStatus // Send the latest status to the channel
+				}
+				offset = info.Size() // Update the offset to the new end of the file
+			}
+		}
+	}()
+
+	return nil
 }
 
-// read log file line by line backwards and try to find the latest userPresence status
-func getLatestStatus(logFilePath string) (TeamsStatus, error) {
-	logFile, err := os.Open(logFilePath)
+func getLatestFileName(folderPath string) (string, error) {
+	files, err := os.ReadDir(folderPath)
 	if err != nil {
-		return TeamsStatusUnknown, err
+		return "", err
 	}
-	fileInfo, err := logFile.Stat()
-	if err != nil {
-		return TeamsStatusUnknown, err
-	}
-	buffer := make([]byte, fileInfo.Size())
-	logFile.Read(buffer)
-	lines := strings.Split(string(buffer), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.ReplaceAll(lines[i], "\r", "")
-		if !strings.Contains(line, "TaskbarBadgeServicePackaged") {
+	var newestFile os.FileInfo
+	for _, file := range files {
+		if file.IsDir() {
 			continue
 		}
-		matches := statusRegex.FindStringSubmatch(line)
-		if len(matches) < 2 {
+		if !isRelevantFile(file.Name()) {
 			continue
 		}
-		if status, ok := StatusString[matches[1]]; ok {
-			return status, nil
+		fileInfo, err := file.Info()
+		if err != nil {
+			continue
+		}
+		if newestFile == nil || fileInfo.ModTime().After(newestFile.ModTime()) {
+			newestFile = fileInfo
 		}
 	}
+	if newestFile == nil {
+		return "", fmt.Errorf("no relevant files found")
+	}
+	return newestFile.Name(), nil
+}
 
-	return TeamsStatusUnknown, nil
+func isRelevantEvent(event fsnotify.Event) bool {
+	if event.Op != fsnotify.Create {
+		return false
+	}
+	return isRelevantFile(event.Name)
+}
+
+func isRelevantFile(path string) bool {
+	return strings.Contains(path, "MSTeams_") && strings.HasSuffix(path, ".log")
+}
+
+func readLine(line string) TeamsStatus {
+	if !strings.Contains(line, "Badge") || !strings.Contains(line, "status") {
+		return TeamsStatusUnknown
+	}
+	line = strings.ReplaceAll(line, "\r", "")
+	matches := statusRegex.FindStringSubmatch(line)
+	if len(matches) < 2 {
+		return TeamsStatusUnknown
+	}
+	if status, ok := StatusString[matches[1]]; ok {
+		return status
+	}
+	return TeamsStatusUnknown
 }
 
 type TeamsStatus int

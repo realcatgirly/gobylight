@@ -23,7 +23,7 @@ func main() {
 	c = make(chan color.RGBA, 1)
 	done = make(chan struct{})
 
-	d, err := device.Devices["console"]()
+	d, err := device.Devices["neotrinkey"]()
 	if err != nil {
 		panic(err)
 	}
