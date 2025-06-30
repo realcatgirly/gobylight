@@ -31,7 +31,7 @@ func newNeoTrinkey() (api.Device, error) {
 
 	for _, port := range ports {
 		if port.VID == "239A" && port.PID == "80F0" {
-			fmt.Printf("vid: %s, pid: %s, name: %s\n", port.VID, port.PID, port.Name)
+			fmt.Printf("found neotrinkey at vid: %s, pid: %s, name: %s\n", port.VID, port.PID, port.Name)
 			buffer := make([]byte, 128)
 			s, err := serial.Open(port.Name, &serial.Mode{
 				BaudRate: 9600,
